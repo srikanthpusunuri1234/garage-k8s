@@ -1,0 +1,255 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: garage-s3
+  labels:
+    name: garage-s3
+---
+# 1. Cluster RPC & Admin Secrets (Replace values via openssl rand -hex 32 in production)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: garage-cluster-secrets
+  namespace: garage-s3
+type: Opaque
+stringData:
+  RPC_SECRET: "94f8a1d7c6e5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b"
+  ADMIN_TOKEN: "c3f1e2d4b5a69788796a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e"
+---
+# 2. Garage Configuration Template
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config-tpl
+  namespace: garage-s3
+data:
+  garage.toml.tpl: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "lmdb"
+    lmdb_map_size = "10G"
+
+    replication_factor = 3
+    consistency_mode = "consistent"
+    compression_level = 1
+
+    rpc_bind_addr = "[::]:3901"
+    rpc_public_addr = "__POD_NAME__.garage-headless.garage-s3.svc.cluster.local:3901"
+    rpc_secret = "__RPC_SECRET__"
+
+    [s3_api]
+    s3_region = "garage"
+    api_bind_addr = "[::]:3900"
+    root_domain = ".s3.garage.localhost"
+
+    [admin]
+    api_bind_addr = "[::]:3903"
+    admin_token = "__ADMIN_TOKEN__"
+---
+# 3. Headless Service for StatefulSet Peer RPC Discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage-headless
+  namespace: garage-s3
+  labels:
+    app: garage
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: garage
+  ports:
+    - name: rpc
+      port: 3901
+      targetPort: 3901
+---
+# 4. Internal ClusterIP Service for Load-Balanced S3 API Traffic
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage-s3
+  namespace: garage-s3
+  labels:
+    app: garage
+spec:
+  type: ClusterIP
+  selector:
+    app: garage
+  ports:
+    - name: s3-api
+      port: 3900
+      targetPort: 3900
+---
+# 5. PodDisruptionBudget to Guarantee Quorum (Minimum 2 of 3 Nodes Up)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: garage-pdb
+  namespace: garage-s3
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: garage
+---
+# 6. Zero-Trust NetworkPolicy for Garage Pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: garage-least-privilege-netpol
+  namespace: garage-s3
+spec:
+  podSelector:
+    matchLabels:
+      app: garage
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow internal RPC (3901) ONLY between Garage replicas
+    - from:
+        - podSelector:
+            matchLabels:
+              app: garage
+      ports:
+        - protocol: TCP
+          port: 3901
+    # Allow S3 API (3900) ONLY from the Media Vault application pods
+    - from:
+        - podSelector:
+            matchLabels:
+              app: media-vault
+      ports:
+        - protocol: TCP
+          port: 3900
+---
+# 7. Garage 3-Replica StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: garage
+  namespace: garage-s3
+spec:
+  serviceName: garage-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: garage
+  template:
+    metadata:
+      labels:
+        app: garage
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread the 3 replicas across the 3 k3d worker nodes
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: garage
+      initContainers:
+        - name: render-config
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              sed -e "s/__POD_NAME__/${POD_NAME}/g" \
+                  -e "s/__RPC_SECRET__/${RPC_SECRET}/g" \
+                  -e "s/__ADMIN_TOKEN__/${ADMIN_TOKEN}/g" \
+                  /tpl/garage.toml.tpl > /etc/garage/garage.toml
+              chmod 0600 /etc/garage/garage.toml
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RPC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: garage-cluster-secrets
+                  key: RPC_SECRET
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: garage-cluster-secrets
+                  key: ADMIN_TOKEN
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config-tpl
+              mountPath: /tpl
+              readOnly: true
+            - name: rendered-config
+              mountPath: /etc/garage
+      containers:
+        - name: garage
+          image: dxflrs/garage:v2.4.1
+          command: ["/garage", "-c", "/etc/garage/garage.toml", "server"]
+          env:
+            - name: RUST_LOG
+              value: "garage=info"
+          ports:
+            - name: s3-api
+              containerPort: 3900
+            - name: rpc
+              containerPort: 3901
+            - name: admin
+              containerPort: 3903
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: rendered-config
+              mountPath: /etc/garage
+              readOnly: true
+            - name: meta
+              mountPath: /var/lib/garage/meta
+            - name: data
+              mountPath: /var/lib/garage/data
+      volumes:
+        - name: config-tpl
+          configMap:
+            name: garage-config-tpl
+        - name: rendered-config
+          emptyDir:
+            medium: Memory
+  volumeClaimTemplates:
+    - metadata:
+        name: meta
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 1Gi
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 5Gi

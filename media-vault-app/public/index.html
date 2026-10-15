@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Garage S3 + PostgreSQL // Media Vault</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    body {
+      font-family: 'Space Grotesk', sans-serif;
+      background:
+        radial-gradient(circle at 12% 10%, rgba(99, 102, 241, 0.18), transparent 40%),
+        radial-gradient(circle at 88% 18%, rgba(16, 185, 129, 0.14), transparent 35%),
+        #07080c;
+      color: #f3f4f6;
+      min-height: 100vh;
+    }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+    .glass {
+      background: rgba(15, 17, 26, 0.78);
+      backdrop-filter: blur(18px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .drop-active {
+      border-color: #6366f1 !important;
+      background: rgba(99, 102, 241, 0.15) !important;
+      transform: scale(1.005);
+    }
+  </style>
+</head>
+<body class="p-6 md:p-10">
+  <div class="max-w-7xl mx-auto space-y-8">
+    <!-- Top Header -->
+    <header class="glass rounded-2xl p-6 flex flex-col lg:flex-row lg:items-center justify-between gap-5 shadow-2xl">
+      <div class="flex items-center gap-4">
+        <div class="w-12 h-12 rounded-xl bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400 font-bold text-xl">
+          S3
+        </div>
+        <div>
+          <div class="flex flex-wrap items-center gap-2.5">
+            <h1 class="text-2xl font-bold tracking-tight">Garage S3 Vault</h1>
+            <span class="mono text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1.5">
+              <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+              RF=3 HA
+            </span>
+            <span class="mono text-xs px-2.5 py-0.5 rounded-full bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+              PostgreSQL 16 Metadata
+            </span>
+          </div>
+          <p class="text-sm text-gray-400 mt-1">Binary chunks stored in 3-node Garage S3 • Locations & ETag indexed in PostgreSQL</p>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-6 mono text-sm">
+        <div>
+          <span class="text-gray-500 block text-[11px]">DB RECORDS</span>
+          <span id="stat-count" class="font-semibold text-white">0</span>
+        </div>
+        <div class="h-8 w-px bg-white/10"></div>
+        <div>
+          <span class="text-gray-500 block text-[11px]">GARAGE S3 USED</span>
+          <span id="stat-size" class="font-semibold text-indigo-400">0 B</span>
+        </div>
+        <div class="h-8 w-px bg-white/10"></div>
+        <div>
+          <span class="text-gray-500 block text-[11px]">BUCKET</span>
+          <span id="stat-bucket" class="font-semibold text-emerald-400">media-vault</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Upload Dropzone -->
+    <section id="dropzone" class="glass rounded-2xl p-8 border-2 border-dashed border-white/15 transition-all duration-200 text-center cursor-pointer hover:border-indigo-500/60">
+      <input type="file" id="file-input" multiple accept="image/*,video/*" class="hidden" />
+      <div class="max-w-lg mx-auto space-y-3">
+        <div class="w-14 h-14 rounded-2xl bg-indigo-500/10 border border-indigo-500/30 mx-auto flex items-center justify-center text-indigo-400">
+          <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+          </svg>
+        </div>
+        <h2 class="text-lg font-semibold">Drop photos or videos to upload, or <span class="text-indigo-400 underline">browse files</span></h2>
+        <p class="text-xs text-gray-400 mono">Writes binary to Garage S3 (:3900) &amp; indexes S3 URI in PostgreSQL (:5432)</p>
+
+        <div id="upload-progress-wrap" class="hidden pt-3 space-y-1.5">
+          <div class="w-full h-2 bg-white/10 rounded-full overflow-hidden">
+            <div id="upload-bar" class="h-full bg-gradient-to-r from-indigo-500 to-emerald-400 transition-all duration-150" style="width: 0%"></div>
+          </div>
+          <p id="upload-status" class="text-xs mono text-indigo-300">Uploading...</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Newly Uploaded Banner (Appears right after upload) -->
+    <section id="latest-upload-banner" class="hidden glass rounded-2xl p-5 border border-emerald-500/40 bg-emerald-950/20">
+      <div class="flex items-center justify-between mb-3">
+        <span class="mono text-xs uppercase tracking-wider text-emerald-400 font-semibold flex items-center gap-2">
+          ✓ Latest Upload Synced to Garage S3 &amp; PostgreSQL
+        </span>
+        <button onclick="document.getElementById('latest-upload-banner').classList.add('hidden')" class="text-xs mono text-gray-400 hover:text-white">Dismiss ✕</button>
+      </div>
+      <div id="latest-upload-details" class="grid grid-cols-1 md:grid-cols-3 gap-4 items-center"></div>
+    </section>
+
+    <!-- Filter & View Switcher -->
+    <div class="flex flex-wrap items-center justify-between gap-4">
+      <div class="flex flex-wrap gap-2">
+        <button onclick="setFilter('all')" id="tab-all" class="px-4 py-2 rounded-xl text-sm font-medium bg-indigo-600 text-white transition">All Media</button>
+        <button onclick="setFilter('photo')" id="tab-photo" class="px-4 py-2 rounded-xl text-sm font-medium glass text-gray-300 hover:text-white transition">Photos</button>
+        <button onclick="setFilter('video')" id="tab-video" class="px-4 py-2 rounded-xl text-sm font-medium glass text-gray-300 hover:text-white transition">Videos</button>
+      </div>
+      <div class="flex items-center gap-2">
+        <button onclick="toggleDbTable()" id="btn-db-view" class="glass px-4 py-2 rounded-xl text-xs mono text-indigo-300 border border-indigo-500/30 hover:bg-indigo-500/10 transition">
+          ⊞ Toggle PostgreSQL Metadata Table
+        </button>
+        <button onclick="loadMedia()" class="glass px-4 py-2 rounded-xl text-xs mono text-gray-300 hover:text-white transition">
+          ↻ Refresh
+        </button>
+      </div>
+    </div>
+
+    <!-- Live PostgreSQL Metadata Table (Collapsible) -->
+    <section id="db-table-section" class="hidden glass rounded-2xl overflow-hidden border border-indigo-500/30">
+      <div class="px-6 py-4 border-b border-white/10 flex items-center justify-between">
+        <div>
+          <h3 class="text-sm font-semibold text-indigo-300 mono">SELECT * FROM media_assets ORDER BY created_at DESC;</h3>
+          <p class="text-xs text-gray-400">Live records fetched from PostgreSQL (`media-db.garage-s3.svc.cluster.local:5432`)</p>
+        </div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left border-collapse mono text-xs">
+          <thead>
+            <tr class="border-b border-white/10 text-gray-400 bg-black/40">
+              <th class="p-3.5">DB UUID</th>
+              <th class="p-3.5">ORIGINAL FILE</th>
+              <th class="p-3.5">S3 URI LOCATION</th>
+              <th class="p-3.5">ETAG</th>
+              <th class="p-3.5">MIME / SIZE</th>
+              <th class="p-3.5">UPLOADED AT</th>
+            </tr>
+          </thead>
+          <tbody id="db-table-body" class="divide-y divide-white/5"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Visual Media Grid -->
+    <section id="media-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6"></section>
+  </div>
+
+  <!-- Fullscreen Lightbox Modal -->
+  <div id="lightbox" class="fixed inset-0 bg-black/90 backdrop-blur-xl hidden z-50 flex items-center justify-center p-6" onclick="closeLightbox(event)">
+    <div class="max-w-5xl w-full flex flex-col items-center gap-4" onclick="event.stopPropagation()">
+      <div id="lightbox-content" class="w-full flex justify-center"></div>
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between w-full glass px-5 py-3.5 rounded-xl gap-2">
+        <div class="min-w-0">
+          <p id="lightbox-title" class="font-semibold text-sm text-white truncate"></p>
+          <p id="lightbox-s3" class="mono text-xs text-emerald-400 truncate"></p>
+        </div>
+        <button onclick="document.getElementById('lightbox').classList.add('hidden'); document.getElementById('lightbox-content').innerHTML='';" class="px-4 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-xs mono shrink-0">Close [ESC]</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let allItems = [];
+    let currentFilter = 'all';
+
+    const formatBytes = (bytes) => {
+      if (!bytes) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    };
+
+    const escapeHtml = (str) => String(str).replace(/[&<>"']/g, s => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[s]));
+
+    async function loadMedia() {
+      const res = await fetch('/api/media');
+      const data = await res.json();
+      allItems = data.items || [];
+
+      document.getElementById('stat-count').textContent = allItems.length;
+      const totalBytes = allItems.reduce((acc, item) => acc + (item.size_bytes || 0), 0);
+      document.getElementById('stat-size').textContent = formatBytes(totalBytes);
+      document.getElementById('stat-bucket').textContent = data.bucket || 'media-vault';
+
+      renderGrid();
+      renderDbTable();
+    }
+
+    function toggleDbTable() {
+      document.getElementById('db-table-section').classList.toggle('hidden');
+    }
+
+    function setFilter(filter) {
+      currentFilter = filter;
+      ['all', 'photo', 'video'].forEach(t => {
+        const btn = document.getElementById('tab-' + t);
+        btn.className = t === filter
+          ? 'px-4 py-2 rounded-xl text-sm font-medium bg-indigo-600 text-white transition'
+          : 'px-4 py-2 rounded-xl text-sm font-medium glass text-gray-300 hover:text-white transition';
+      });
+      renderGrid();
+    }
+
+    function renderDbTable() {
+      const tbody = document.getElementById('db-table-body');
+      if (allItems.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" class="p-6 text-center text-gray-500">No rows in media_assets table yet.</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = allItems.map(item => `
+        <tr class="hover:bg-white/5">
+          <td class="p-3.5 text-indigo-300">${escapeHtml(item.id.slice(0, 8))}…</td>
+          <td class="p-3.5 text-white font-medium">${escapeHtml(item.original_name)}</td>
+          <td class="p-3.5 text-emerald-400">${escapeHtml(item.s3_uri)}</td>
+          <td class="p-3.5 text-gray-400">${escapeHtml((item.etag || 'n/a').slice(0, 12))}</td>
+          <td class="p-3.5 text-gray-300">${escapeHtml(item.mime_type)} (${formatBytes(item.size_bytes)})</td>
+          <td class="p-3.5 text-gray-400">${new Date(item.created_at).toLocaleTimeString()}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderGrid() {
+      const grid = document.getElementById('media-grid');
+      const filtered = currentFilter === 'all' ? allItems : allItems.filter(i => i.media_type === currentFilter);
+
+      if (filtered.length === 0) {
+        grid.innerHTML = `
+          <div class="col-span-full glass rounded-2xl p-12 text-center text-gray-400">
+            <p class="mono text-sm">No media found. Drop a photo or video above to store it in Garage S3 + PostgreSQL!</p>
+          </div>`;
+        return;
+      }
+
+      grid.innerHTML = filtered.map(item => `
+        <article class="glass rounded-2xl overflow-hidden group flex flex-col justify-between transition hover:-translate-y-1 hover:border-indigo-500/40 shadow-xl">
+          <div>
+            <!-- Live Browser Preview -->
+            <div class="relative aspect-video bg-black/70 overflow-hidden cursor-pointer"
+                 onclick="openLightbox('${item.stream_url}', '${item.media_type}', '${escapeHtml(item.original_name)}', '${escapeHtml(item.s3_uri)}')">
+              ${item.media_type === 'video'
+                ? `<video src="${item.stream_url}" controls preload="metadata" class="w-full h-full object-cover" onclick="event.stopPropagation()"></video>
+                   <span class="absolute top-3 left-3 px-2.5 py-0.5 rounded-md bg-black/80 text-indigo-300 mono text-[10px] uppercase tracking-wider border border-indigo-500/30 pointer-events-none">▶ Video</span>`
+                : `<img src="${item.stream_url}" alt="${escapeHtml(item.original_name)}" loading="lazy" class="w-full h-full object-cover group-hover:scale-105 transition duration-300" />
+                   <span class="absolute top-3 left-3 px-2.5 py-0.5 rounded-md bg-black/80 text-emerald-300 mono text-[10px] uppercase tracking-wider border border-emerald-500/30">● Photo</span>`
+              }
+            </div>
+
+            <!-- PostgreSQL & S3 Location Metadata Panel -->
+            <div class="p-4 space-y-2.5">
+              <div class="flex items-start justify-between gap-2">
+                <h3 class="text-sm font-semibold text-white truncate" title="${escapeHtml(item.original_name)}">
+                  ${escapeHtml(item.original_name)}
+                </h3>
+                <span class="mono text-xs text-indigo-300 shrink-0">${formatBytes(item.size_bytes)}</span>
+              </div>
+
+              <div class="rounded-xl bg-black/50 border border-white/5 p-2.5 space-y-1 mono text-[11px]">
+                <div class="flex justify-between gap-2">
+                  <span class="text-gray-500">S3 URI:</span>
+                  <span class="text-emerald-400 truncate" title="${escapeHtml(item.s3_uri)}">${escapeHtml(item.s3_uri)}</span>
+                </div>
+                <div class="flex justify-between gap-2">
+                  <span class="text-gray-500">DB UUID:</span>
+                  <span class="text-gray-300 truncate">${escapeHtml(item.id)}</span>
+                </div>
+                <div class="flex justify-between gap-2">
+                  <span class="text-gray-500">ETag:</span>
+                  <span class="text-gray-400 truncate">${escapeHtml(item.etag || 'none')}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Card Footer Actions -->
+          <div class="px-4 pb-4 pt-1 flex items-center justify-between gap-2">
+            <a href="${item.stream_url}" target="_blank" class="mono text-xs text-indigo-400 hover:text-indigo-300 underline">
+              Open Direct Stream ↗
+            </a>
+            <button onclick="deleteMedia('${item.id}')" class="px-3 py-1.5 rounded-xl bg-rose-500/10 text-rose-400 hover:bg-rose-500 hover:text-white border border-rose-500/20 mono text-xs transition">
+              Delete S3 + DB
+            </button>
+          </div>
+        </article>
+      `).join('');
+    }
+
+    function showLatestBanner(item) {
+      const banner = document.getElementById('latest-upload-banner');
+      const details = document.getElementById('latest-upload-details');
+      banner.classList.remove('hidden');
+      details.innerHTML = `
+        <div class="aspect-video rounded-xl overflow-hidden bg-black/60 border border-white/10">
+          ${item.media_type === 'video'
+            ? `<video src="${item.stream_url}" controls autoplay muted class="w-full h-full object-contain"></video>`
+            : `<img src="${item.stream_url}" class="w-full h-full object-contain" />`
+          }
+        </div>
+        <div class="md:col-span-2 mono text-xs space-y-1.5">
+          <p><span class="text-gray-400">File Name:</span> <span class="text-white font-semibold">${escapeHtml(item.original_name)}</span></p>
+          <p><span class="text-gray-400">PostgreSQL ID:</span> <span class="text-indigo-300">${escapeHtml(item.id)}</span></p>
+          <p><span class="text-gray-400">Garage S3 URI:</span> <span class="text-emerald-400">${escapeHtml(item.s3_uri)}</span></p>
+          <p><span class="text-gray-400">Garage S3 Endpoint:</span> <span class="text-gray-300">${escapeHtml(item.s3_endpoint)}</span></p>
+          <p><span class="text-gray-400">S3 ETag:</span> <span class="text-gray-300">${escapeHtml(item.etag)}</span></p>
+        </div>
+      `;
+    }
+
+    function openLightbox(url, type, title, s3Uri) {
+      const box = document.getElementById('lightbox');
+      const content = document.getElementById('lightbox-content');
+      document.getElementById('lightbox-title').textContent = title;
+      document.getElementById('lightbox-s3').textContent = s3Uri;
+      content.innerHTML = type === 'video'
+        ? `<video src="${url}" controls autoplay class="max-h-[75vh] rounded-xl shadow-2xl"></video>`
+        : `<img src="${url}" class="max-h-[75vh] rounded-xl shadow-2xl object-contain" />`;
+      box.classList.remove('hidden');
+    }
+
+    function closeLightbox(e) {
+      if (e.target.id === 'lightbox') {
+        document.getElementById('lightbox').classList.add('hidden');
+        document.getElementById('lightbox-content').innerHTML = '';
+      }
+    }
+
+    async function deleteMedia(id) {
+      await fetch('/api/media/' + encodeURIComponent(id), { method: 'DELETE' });
+      await loadMedia();
+    }
+
+    async function uploadFiles(files) {
+      if (!files.length) return;
+      const wrap = document.getElementById('upload-progress-wrap');
+      const bar = document.getElementById('upload-bar');
+      const status = document.getElementById('upload-status');
+      wrap.classList.remove('hidden');
+      let lastUploaded = null;
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        status.textContent = `Uploading (${i + 1}/${files.length}): ${file.name}`;
+        lastUploaded = await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          const form = new FormData();
+          form.append('file', file);
+          xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable) {
+              const pct = Math.round(((i + e.loaded / e.total) / files.length) * 100);
+              bar.style.width = pct + '%';
+            }
+          };
+          xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              resolve(JSON.parse(xhr.responseText));
+            } else {
+              reject(new Error(xhr.responseText));
+            }
+          };
+          xhr.onerror = () => reject(new Error('Network error'));
+          xhr.open('POST', '/api/upload');
+          xhr.send(form);
+        });
+      }
+
+      bar.style.width = '100%';
+      status.textContent = 'Stored in Garage S3 & indexed in PostgreSQL!';
+      setTimeout(() => { wrap.classList.add('hidden'); bar.style.width = '0%'; }, 1400);
+
+      if (lastUploaded) showLatestBanner(lastUploaded);
+      await loadMedia();
+    }
+
+    const dz = document.getElementById('dropzone');
+    const input = document.getElementById('file-input');
+    dz.addEventListener('click', () => input.click());
+    input.addEventListener('change', (e) => uploadFiles(e.target.files));
+    dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.classList.add('drop-active'); });
+    dz.addEventListener('dragleave', () => dz.classList.remove('drop-active'));
+    dz.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dz.classList.remove('drop-active');
+      uploadFiles(e.dataTransfer.files);
+    });
+
+    loadMedia();
+  </script>
+</body>
+</html>
