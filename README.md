@@ -13,7 +13,7 @@ Instead of relying on AWS S3, this project provisions a **3-replica Garage S3 St
 </p>
 
 
-Apply the garage.yaml for s3 pods 
+## Apply the garage.yaml for s3 pods 
 
 Run the bootstrap script to join the 3 replicas over headless DNS, assign `zone-a`, `zone-b`, and `zone-c`, create the `media-vault` bucket, and inject the least-privilege S3 credentials into the `media-s3-creds` Kubernetes Secret:
 
